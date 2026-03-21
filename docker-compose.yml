@@ -1,0 +1,225 @@
+
+
+services:
+
+  # localai:
+  #   image: quay.io/go-skynet/local-ai:master
+  #   container_name: copilot-localai
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - ./localai/models:/models
+  #   environment:
+  #     - MODELS_PATH=/models
+
+  ollama:
+    image: ollama/ollama
+    container_name: copilot-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    
+    networks:
+      - copilot-network
+
+  # One-shot helper to pull the model into the ollama volume on first run.
+  # Safe to re-run; ollama will skip already-present layers.
+  ollama-pull:
+    image: ollama/ollama
+    container_name: copilot-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      # "Most stable" default; if this doesn't exist on your Ollama registry/version,
+      # the script falls back through a few common model names.
+      - OLLAMA_MODEL=llama3.1:8b
+    entrypoint:
+      - sh
+      - -lc
+      - >
+        i=0;
+        until ollama list >/dev/null 2>&1; do
+          i=$$((i+1));
+          if [ "$$i" -ge 60 ]; then echo "ollama not ready"; exit 1; fi;
+          sleep 1;
+        done;
+        picked="";
+        for m in "$$OLLAMA_MODEL" "llama3.1:8b" "llama3.1" "llama3:8b" "llama3" "mistral" "phi3:mini"; do
+          if [ -n "$$m" ] && ollama pull "$$m"; then picked="$$m"; break; fi;
+        done;
+        if [ -z "$$picked" ]; then echo "failed to pull any model"; exit 1; fi;
+        mkdir -p /config;
+        printf "%s" "$$picked" > /config/ollama_model
+    restart: "no"
+    volumes:
+      - copilot-config:/config
+    networks:
+      - copilot-network
+    
+    
+
+  stt:
+    build: ./services/stt-service
+    container_name: copilot-stt    
+    ports:
+      - "8001:8001"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    
+    networks:
+      - copilot-network
+
+  backend:
+    build: ./services/gateway
+    container_name: copilot-backend
+    ports:
+      - "4000:4000"
+
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
+      stt:
+        condition: service_started
+      # postgres:
+      #   condition: service_started
+    
+    environment:
+      # STT_SERVICE_URL: "http://stt:8001/transcribe"
+      # OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      # OPENROUTER_MODEL: ${OPENROUTER_MODEL}
+      # APP_URL: http://localhost:3000
+      # APP_NAME: Copilot App
+      - OLLAMA_API=http://ollama:11434
+      - OLLAMA_MODEL_FILE=/config/ollama_model
+      - STT_API=http://stt:8001/transcribe
+      - AUTOMATION_MODE=dry-run
+      - AUTO_MEETING_MONITOR=true
+      - AUTO_MEETING_REPLY_TO_APP=true
+      - AUTOMATION_ENDPOINT=http://host.docker.internal:4010
+      - AUTO_MEETING_DETECT_ENDPOINT=http://host.docker.internal:4010
+      - DATABASE_URL=postgresql://copilot:copilot@postgres:5432/copilot
+      - USE_DATABASE=true
+      # For real Windows automation, run the local desktop agent on the host.
+      # Set AUTOMATION_MODE=live for real typing/click actions.
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - copilot-network
+    volumes:
+      - copilot-config:/config
+      - copilot-data:/app/data
+
+  frontend:
+    build: ./apps/overlay-ui
+    container_name: copilot-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - copilot-network
+
+  voice-service:
+    build: ./services/voice-service
+    container_name: copilot-voice-service
+    profiles: ["full"]
+    ports:
+      - "8002:8002"
+    networks:
+      - copilot-network
+
+  llm-service:
+    build: ./services/llm-service
+    container_name: copilot-llm-service
+    profiles: ["full"]
+    environment:
+      - OLLAMA_API=http://ollama:11434
+    ports:
+      - "8003:8003"
+    depends_on:
+      - ollama
+    networks:
+      - copilot-network
+
+  diarization-service:
+    build: ./services/diarization-service
+    container_name: copilot-diarization-service
+    profiles: ["full"]
+    ports:
+      - "8004:8004"
+    networks:
+      - copilot-network
+
+  tts-service:
+    build: ./services/tts-service
+    container_name: copilot-tts-service
+    profiles: ["full"]
+    ports:
+      - "8005:8005"
+    networks:
+      - copilot-network
+
+  perception-service:
+    build: ./services/perception-service
+    container_name: copilot-perception-service
+    profiles: ["full"]
+    ports:
+      - "8006:8006"
+    networks:
+      - copilot-network
+
+  # Optional storage stack (enable with: `docker compose --profile storage up -d`)
+  redis:
+    image: redis:7-alpine
+    container_name: copilot-redis
+    profiles: ["storage"]
+    ports:
+      - "6379:6379"
+    networks:
+      - copilot-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: copilot-postgres
+    profiles: ["storage"]
+    environment:
+      - POSTGRES_USER=copilot
+      - POSTGRES_PASSWORD=copilot
+      - POSTGRES_DB=copilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    networks:
+      - copilot-network
+
+  qdrant:
+    image: qdrant/qdrant:v1.10.1
+    container_name: copilot-qdrant
+    profiles: ["storage"]
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant:/qdrant/storage
+    networks:
+      - copilot-network
+
+volumes:
+  ollama:
+  copilot-config:
+  copilot-data:
+  postgres:
+  qdrant:
+
+networks:
+  copilot-network:
